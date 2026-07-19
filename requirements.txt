@@ -1,0 +1,7 @@
+shapely==2.1.2
+triangle==20250106
+networkx==3.6.1
+matplotlib==3.11.0
+numpy==2.5.0
+sortedcontainers==2.4.0
+pytest==9.1.1
