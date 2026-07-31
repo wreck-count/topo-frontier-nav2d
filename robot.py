@@ -11,6 +11,8 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib import lines
 from matplotlib import animation
+from matplotlib.patches import Patch, PathPatch
+from matplotlib.path import Path
 import numpy as np
 import heapq
 
@@ -29,6 +31,19 @@ def flatten_parts(geometry: BaseGeometry) -> list[BaseGeometry]:
         else:
             result.append(p)
     return result
+
+
+def _polygon_patch(poly: Polygon, **kwargs: Any) -> PathPatch:
+    vertices: list[tuple[float, float]] = []
+    codes: list[int] = []
+    for ring in [poly.exterior, *poly.interiors]:
+        coords = list(ring.coords)
+        vertices.extend(coords)
+        codes.append(Path.MOVETO)
+        codes.extend([Path.LINETO] * (len(coords) - 2))
+        codes.append(Path.CLOSEPOLY)
+    path = Path(vertices, codes)
+    return PathPatch(path, **kwargs)
 
 
 class Vec2i:
@@ -283,9 +298,10 @@ class Robot:
         self.visited: set[TopoId] = set()
         self.obstacle_verts: set[TopoId] = set()
         self.follow_path: tuple[int, list[TopoId]] = (0, [])
-        self.last_scan_poly: Polygon | None = None
+        self.last_scan_polys: list[Polygon] = []
         self.scan_log: list[tuple[float, float]] = []
         self.on_scan: Callable[[], None] | None = None
+        self.unreachable_frontier_log: list[tuple[TopoId, list[TopoId]]] = []
 
     def _get_regular_polygon(self, radius: float, centre: Point, point_count: int):
         if point_count < 3:
@@ -411,6 +427,7 @@ class Robot:
         print('new regions')
         for new_poly in new_regions:
             print(new_poly)
+        self.last_scan_polys = list(new_regions)
         for new_poly in new_regions:
             self._map_new_region(new_poly, scan_interaction[0])
        
@@ -444,11 +461,10 @@ class Robot:
             if v in hdist and hdist[v] < h:
                 continue
             for nb in self.mapping.neighbors(v):
-                if nb in self.obstacle_verts:
-                    continue
-                if nb not in dist or dist[nb] > dist[v] + 1:
+                edge_cost = 1 + (INF if nb in self.obstacle_verts else 0)
+                if nb not in dist or dist[nb] > dist[v] + edge_cost:
                     parent[nb] = v
-                    dist[nb] = dist[v] + 1
+                    dist[nb] = dist[v] + edge_cost
                     hdist[nb] = dist[nb] + _heuristic(nb)
                     heapq.heappush(pq, (hdist[nb], nb))
 
@@ -467,11 +483,19 @@ class Robot:
         path_idx, path = self.follow_path
         if path_idx + 1 >= len(path):
             frontier = self.mapping.boundary_verts.difference(self.obstacle_verts)
-            if len(frontier) == 0:
-                return
-            dest_id = next(iter(frontier))
-            path_to_nxt = self.__a_star(cur_vert.id, dest_id)
-            self.follow_path = (0, path_to_nxt)
+            unreachable: list[TopoId] = []
+            for dest_id in frontier:
+                path_to_nxt = self.__a_star(cur_vert.id, dest_id)
+                if path_to_nxt:
+                    if unreachable:
+                        print(f'WARNING: frontier vertices unreachable from {cur_vert.id}, skipped: {unreachable}')
+                        self.unreachable_frontier_log.append((cur_vert.id, list(unreachable)))
+                    self.follow_path = (0, path_to_nxt)
+                    return
+                unreachable.append(dest_id)
+            if unreachable:
+                print(f'WARNING: ALL frontier vertices unreachable from {cur_vert.id}: {unreachable}')
+                self.unreachable_frontier_log.append((cur_vert.id, list(unreachable)))
             return
         path_idx += 1
         self.follow_path = (path_idx, path)
@@ -657,9 +681,10 @@ class Simulator:
         self.robot.position = robot_position
         self.paused = False
         self.fig, self.ax = plt.subplots()
-        self._blink_poly: Polygon | None = None
+        self.fig.subplots_adjust(right=0.78)
+        self._blink_polys: list[Polygon] = []
         self._blink_frames_left: int = 0
-        self._focus_poly: Polygon | None = None
+        self._focus_polys: list[Polygon] = []
         self.fig.canvas.mpl_connect('button_press_event', self.on_pick)
         self.fig.canvas.mpl_connect('key_press_event', self.on_key_press)
         self.robot.on_scan = self._auto_save_recording
@@ -693,9 +718,12 @@ class Simulator:
 
     def _draw(self):
         self.ax.clear()
-        if self._blink_frames_left > 0 and self._blink_poly is not None and not self._blink_poly.is_empty:
+        if self._blink_frames_left > 0 and self._blink_polys:
             if self._blink_frames_left % 2 == 0:
-                self.ax.fill(*self._blink_poly.exterior.xy, color='yellow', alpha=0.4, zorder=0)  # pyright: ignore
+                for poly in self._blink_polys:
+                    if poly.is_empty:
+                        continue
+                    self.ax.add_patch(_polygon_patch(poly, facecolor='yellow', alpha=0.4, zorder=0))
             self._blink_frames_left -= 1
         for obstacle in self.obstacles:
             if isinstance(obstacle, Maze):
@@ -717,6 +745,17 @@ class Simulator:
         obstacle_verts = [mesh.get_vert(id) for id in self.robot.obstacle_verts]
         self.ax.scatter([v.pos.x for v in obstacle_verts], [v.pos.y for v in obstacle_verts], s=20, color='brown', picker=True)
         self.ax.scatter([self.robot.position.x], [self.robot.position.y], s=40, color='tab:red', picker=True)
+        legend_handles = [
+            lines.Line2D([0], [0], color='black', linewidth=1.5, label='Maze wall'),
+            lines.Line2D([0], [0], color='tab:red', linewidth=0.5, label='Frontier edge'),
+            lines.Line2D([0], [0], color='tab:blue', linewidth=0.5, label='Mesh edge'),
+            lines.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:blue', markersize=6, label='Vertex'),
+            lines.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:orange', markersize=6, label='Boundary vertex'),
+            lines.Line2D([0], [0], marker='o', color='w', markerfacecolor='brown', markersize=6, label='Obstacle vertex'),
+            lines.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:red', markersize=8, label='Robot'),
+            Patch(facecolor='yellow', alpha=0.4, label='Latest scan'),
+        ]
+        self.ax.legend(handles=legend_handles, loc='upper left', bbox_to_anchor=(1.02, 1.0), fontsize='small', borderaxespad=0)
         self.ax.set_aspect('equal')
         view_bounds: list[float] | None = None
         for obstacle in self.obstacles:
@@ -744,11 +783,11 @@ class Simulator:
             if max_ticks is not None and ticks >= max_ticks:
                 return []
             self.process()
-            if self.robot.last_scan_poly is not None:
-                self._blink_poly = self.robot.last_scan_poly
+            if self.robot.last_scan_polys:
+                self._blink_polys = self.robot.last_scan_polys
                 self._blink_frames_left = 6
-                self._focus_poly = self.robot.last_scan_poly
-                self.robot.last_scan_poly = None
+                self._focus_polys = self.robot.last_scan_polys
+                self.robot.last_scan_polys = []
             ticks += 1
             self._draw()
             return []
@@ -782,12 +821,14 @@ def visualize_recording(path: str, interval_ms: float = 500) -> Simulator:
     maze = Maze.from_dict(data['maze'])
     scan_log = [(x, y) for x, y in data['scan_log']]
     sim = Simulator(Point(*scan_log[0]), [maze])
+    sim.robot.on_scan = None
     sim.robot.scan_radius = data.get('scan_radius', 5.0)
     sim.robot.scan_resolution = data.get('scan_resolution', 8)
-
+    live_process = sim.process
     step = {'i': 0}
     def replay_step() -> None:
         if step['i'] >= len(scan_log):
+            live_process()
             return
         sim.robot.position = Point(*scan_log[step['i']])
         sim.robot.perform_scan(maze)
