@@ -60,7 +60,7 @@ class GridIndex[T]:
         mix, miy, mxx, mxy = bounds
         # expand the box a little
         mix -= EPS
-        miy += EPS 
+        miy -= EPS 
         mxx += EPS
         mxy += EPS
         mi_ridx, mi_cidx = self.__get_index((mix, miy))
@@ -70,7 +70,7 @@ class GridIndex[T]:
         for ridx in range(mi_ridx, mx_ridx + 1):
             if ridx not in self.rows:
                 continue
-            for _, elem in self.rows[ridx].irange(mi_cidx, mx_cidx):
+            for _, elem in self.rows[ridx].irange((mi_cidx, 0), (mx_cidx, 0)):
                 imix, imiy, imxx, imxy = self.elems[elem]
                 if imix <= mxx and imiy <= mxy and imxx >= mix and imxy >= miy and elem not in seen:
                     result.append(elem) 
