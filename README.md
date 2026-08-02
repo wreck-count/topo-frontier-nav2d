@@ -7,6 +7,10 @@ This is **not** SLAM : the robot's position is known exactly (no sensor noise, n
 ![Example run: robot exploring a maze, with the mesh, frontier, and legend visible](simulation_examples/sim_example_1.png)
 ![](simulation_examples/sim_example_2.png)
 
+A full run, start to finish:
+
+![Full example run: robot exploring and fully mapping a maze](simulation_examples/sim_example_3.gif)
+
 ## How it works
 
 1. **Scan** : the robot casts a regular polygon "sensor" footprint around its position and intersects it with the environment (`Interactable.interact_scan`), clipping against any walls in line-of-sight.
@@ -43,7 +47,7 @@ visualize_recording('tests/fixtures/sample_run.json')
 
 - `robot.py` : everything; mesh/graph data structures, triangulation, frontier tracking, A\*, the `Maze` obstacle, and the `Simulator`/animation loop. (Splitting this into modules is a planned cleanup.)
 - `simulation.py` : entry point for a live run.
-- `grid_index.py` : a spatial grid index, not yet wired into `robot.py`.
+- `grid_index.py` : a spatial grid index.
 - `tests/` : replay-based regression tests and fixtures.
 
 ## Status
@@ -53,4 +57,3 @@ Working end-to-end for a single robot exploring a static 2D maze. Known gaps / n
 - `robot.py` is a monolith and needs splitting into modules.
 - No sensor noise or localization uncertainty (see note above on SLAM).
 - Frontier selection picks the first reachable frontier vertex found, not the nearest one.
-- `grid_index.py` (spatial indexing for nearest-neighbor lookups) exists but isn't integrated yet.

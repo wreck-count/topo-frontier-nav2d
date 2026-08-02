@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 tests/fixtures/_live_recovery.json
 learning/
+*.mp4

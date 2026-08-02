@@ -11,10 +11,13 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib import lines
 from matplotlib import animation
+from matplotlib.artist import Artist
+from matplotlib.collections import LineCollection, PathCollection
 from matplotlib.patches import Patch, PathPatch
 from matplotlib.path import Path
 import numpy as np
 import heapq
+from grid_index import GridIndex
 
 type TopoId = str
 type SearchElement = tuple[TopoId, TopoId]
@@ -84,6 +87,8 @@ class Mesh:
         self.graph: nx.Graph[TopoId] = nx.Graph()
         self.boundary: set[TopoId] = set()
         self.edge_map: dict[TopoId, Edge] = dict()
+        self.e_index: GridIndex[TopoId] = GridIndex()
+        self.v_index: GridIndex[TopoId] = GridIndex()
 
     @property
     def boundary_verts(self):
@@ -194,7 +199,8 @@ class Mesh:
 
     def find_vert(self, u: Point | TopoId) -> Vertex | None:
         if isinstance(u, Point):
-            matches = [v for v in self.verts() if v.pos.equals_exact(u, EPS)]
+            nearby_verts = [self.graph.nodes[id]['obj'] for id in self.v_index.query(u.bounds)]
+            matches = [v for v in nearby_verts if v.pos.equals_exact(u, EPS)]
             return matches[0] if matches else None
         return self.graph.nodes[u]['obj'] if self.graph.has_node(u) else None
 
@@ -208,6 +214,7 @@ class Mesh:
         vert = self.find_vert(pos)
         if vert is None:
             new_vert = Vertex(pos)
+            self.v_index.insert(new_vert.id, pos.bounds)
             self.graph.add_node(new_vert.id, obj = new_vert)
             return new_vert
         return vert
@@ -217,6 +224,7 @@ class Mesh:
         if mu is None:
             return False
         self.graph.remove_node(mu.id)
+        self.v_index.remove(mu.id)
         return True
 
     def has_edge(self, u: Point | TopoId, v: Point | TopoId):
@@ -229,7 +237,8 @@ class Mesh:
             raise LookupError('vertices not found in mesh, edge not added')
         e = self.find_edge(mu.id, mv.id)
         if e is None:
-            new_edge = Edge(mu, mv)
+            new_edge = Edge(mu, mv) 
+            self.e_index.insert(new_edge.id, LineString([mu.pos, mv.pos]).bounds)
             self.edge_map[new_edge.id] = new_edge
             self.graph.add_edge(mu.id, mv.id, obj = new_edge)
             return new_edge
@@ -256,6 +265,7 @@ class Mesh:
         if me is None:
             return False
         self.graph.remove_edge(me.u, me.v)
+        self.e_index.remove(me.id)
         self.edge_map.pop(me.id)
         return True
 
@@ -273,7 +283,8 @@ class Mesh:
             mv = self.get_vert(e.v)
             line = LineString([mu.pos, mv.pos])
             return line.distance(pos) < EPS
-        return [e for e in self.edges() if _in_edge(e)]
+        nearby_edges = [self.edge_map[id] for id in self.e_index.query(pos.bounds)]
+        return [e for e in nearby_edges if _in_edge(e)]
 
     def get_closest_vert(self, pos: Point) -> Vertex | None:
         closest_dist = math.inf
@@ -322,7 +333,7 @@ class Robot:
         verts = np.vstack([bound_pts, interior_arr])
         segments = [(i, (i + 1)% n) for i in range(n)]
         data = {'vertices': verts, 'segments': np.array(segments)}
-        result = cast(dict[str, np.ndarray], tr.triangulate(data, 'pqS5e'))
+        result = cast(dict[str, np.ndarray], tr.triangulate(data, 'pqa3.0S5e'))
         verts_out: np.ndarray = result['vertices']
         edges: np.ndarray = result['edges']
         triangles: np.ndarray = result['triangles']
@@ -679,15 +690,17 @@ class Simulator:
         self.robot = Robot(5.0)
         self.obstacles = obstacles
         self.robot.position = robot_position
-        self.paused = False
+        self.paused = True
         self.fig, self.ax = plt.subplots()
         self.fig.subplots_adjust(right=0.78)
         self._blink_polys: list[Polygon] = []
         self._blink_frames_left: int = 0
         self._focus_polys: list[Polygon] = []
+        self._blink_patches: list[PathPatch] = []
         self.fig.canvas.mpl_connect('button_press_event', self.on_pick)
         self.fig.canvas.mpl_connect('key_press_event', self.on_key_press)
         self.robot.on_scan = self._auto_save_recording
+        self._init_artists()
 
     def _auto_save_recording(self) -> None:
         for obstacle in self.obstacles:
@@ -716,35 +729,29 @@ class Simulator:
             tick += 1
             time.sleep(tick_seconds)
 
-    def _draw(self):
-        self.ax.clear()
-        if self._blink_frames_left > 0 and self._blink_polys:
-            if self._blink_frames_left % 2 == 0:
-                for poly in self._blink_polys:
-                    if poly.is_empty:
-                        continue
-                    self.ax.add_patch(_polygon_patch(poly, facecolor='yellow', alpha=0.4, zorder=0))
-            self._blink_frames_left -= 1
+    def _init_artists(self):
+        """Build the scene once. The maze walls, the legend and the axes never
+        change, and the mesh needs two collections rather than one Line2D per
+        edge -- rebuilding ~1k artists per frame is what made big maps crawl."""
+        wall_segments: list[list[tuple[float, ...]]] = []
         for obstacle in self.obstacles:
             if isinstance(obstacle, Maze):
-                for wall in obstacle.walls:
-                    xs, ys = wall.xy
-                    self.ax.plot(xs, ys, color='black', linewidth=1.5)
-        mesh = self.robot.mapping
-        for e in mesh.edges():
-            mu = mesh.get_vert(e.u)
-            mv = mesh.get_vert(e.v)
-            if e.id in mesh.boundary:
-                self.ax.plot([mu.pos.x, mv.pos.x], [mu.pos.y, mv.pos.y], color='tab:red', linewidth=0.5)
-            else:
-                self.ax.plot([mu.pos.x, mv.pos.x], [mu.pos.y, mv.pos.y], color='tab:blue', linewidth=0.5)
-        verts = mesh.verts()
-        self.ax.scatter([v.pos.x for v in verts], [v.pos.y for v in verts], s=10, color='tab:blue', picker=True)
-        boundary_verts = [mesh.get_vert(id) for id in mesh.boundary_verts]
-        self.ax.scatter([v.pos.x for v in boundary_verts], [v.pos.y for v in boundary_verts], s=20, color='tab:orange', picker=True)
-        obstacle_verts = [mesh.get_vert(id) for id in self.robot.obstacle_verts]
-        self.ax.scatter([v.pos.x for v in obstacle_verts], [v.pos.y for v in obstacle_verts], s=20, color='brown', picker=True)
-        self.ax.scatter([self.robot.position.x], [self.robot.position.y], s=40, color='tab:red', picker=True)
+                wall_segments.extend([list(wall.coords) for wall in obstacle.walls])
+        self.ax.add_collection(LineCollection(wall_segments, colors='black', linewidths=1.5, zorder=1))
+
+        self._edge_lines = LineCollection([], colors='tab:blue', linewidths=0.5, zorder=2)
+        self._frontier_lines = LineCollection([], colors='tab:red', linewidths=0.5, zorder=3)
+        self.ax.add_collection(self._edge_lines)
+        self.ax.add_collection(self._frontier_lines)
+
+        def _dots(size: float, color: str, zorder: int) -> PathCollection:
+            return self.ax.scatter([], [], s=size, color=color, picker=True, zorder=zorder)
+
+        self._vert_dots = _dots(10, 'tab:blue', 4)
+        self._boundary_dots = _dots(20, 'tab:orange', 5)
+        self._obstacle_dots = _dots(20, 'brown', 6)
+        self._robot_dot = _dots(40, 'tab:red', 7)
+
         legend_handles = [
             lines.Line2D([0], [0], color='black', linewidth=1.5, label='Maze wall'),
             lines.Line2D([0], [0], color='tab:red', linewidth=0.5, label='Frontier edge'),
@@ -775,13 +782,60 @@ class Simulator:
         self.ax.set_xlim(minx - pad, maxx + pad)
         self.ax.set_ylim(miny - pad, maxy + pad)
 
+    def _dynamic_artists(self) -> list[Artist]:
+        """Everything _draw touches. Returned to FuncAnimation so blitting can
+        redraw just these over a cached background, skipping the legend and tick
+        text relayout that otherwise dominates every frame."""
+        return [self._edge_lines, self._frontier_lines, self._vert_dots,
+                self._boundary_dots, self._obstacle_dots, self._robot_dot,
+                *self._blink_patches]
+
+    def _offsets(self, points: list[Point]) -> np.ndarray:
+        if not points:
+            return np.empty((0, 2))
+        return np.array([[p.x, p.y] for p in points])
+
+    def _draw(self) -> list[Artist]:
+        for patch in self._blink_patches:
+            patch.remove()
+        self._blink_patches = []
+        if self._blink_frames_left > 0 and self._blink_polys:
+            if self._blink_frames_left % 2 == 0:
+                for poly in self._blink_polys:
+                    if poly.is_empty:
+                        continue
+                    patch = _polygon_patch(poly, facecolor='yellow', alpha=0.4, zorder=0)
+                    self.ax.add_patch(patch)
+                    self._blink_patches.append(patch)
+            self._blink_frames_left -= 1
+
+        mesh = self.robot.mapping
+        edge_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        frontier_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        for e in mesh.edges():
+            mu = mesh.get_vert(e.u)
+            mv = mesh.get_vert(e.v)
+            segment = ((mu.pos.x, mu.pos.y), (mv.pos.x, mv.pos.y))
+            if e.id in mesh.boundary:
+                frontier_segments.append(segment)
+            else:
+                edge_segments.append(segment)
+        self._edge_lines.set_segments(edge_segments)
+        self._frontier_lines.set_segments(frontier_segments)
+
+        self._vert_dots.set_offsets(self._offsets([v.pos for v in mesh.verts()]))
+        self._boundary_dots.set_offsets(self._offsets([mesh.get_vert(id).pos for id in mesh.boundary_verts]))
+        self._obstacle_dots.set_offsets(self._offsets([mesh.get_vert(id).pos for id in self.robot.obstacle_verts]))
+        self._robot_dot.set_offsets(self._offsets([self.robot.position]))
+        return self._dynamic_artists()
+
     def animate(self, interval_ms: float = 500, max_ticks: int | None = None):
         self._draw()
         ticks = 0
-        def update(_frame: int) -> list[lines.Line2D]:
+        def update(_frame: int) -> list[Artist]:
             nonlocal ticks
             if max_ticks is not None and ticks >= max_ticks:
-                return []
+                return self._dynamic_artists()
             self.process()
             if self.robot.last_scan_polys:
                 self._blink_polys = self.robot.last_scan_polys
@@ -789,9 +843,8 @@ class Simulator:
                 self._focus_polys = self.robot.last_scan_polys
                 self.robot.last_scan_polys = []
             ticks += 1
-            self._draw()
-            return []
-        self._anim = animation.FuncAnimation(self.fig, update, interval=interval_ms, cache_frame_data=False)
+            return self._draw()
+        self._anim = animation.FuncAnimation(self.fig, update, interval=interval_ms, cache_frame_data=False, blit=True)
         plt.show()
 
     def on_pick(self, event):
